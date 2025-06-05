@@ -15,14 +15,14 @@ from piano_syllabus import PianoSyllabusDataset, collate_fn_with_dynamic_padding
 # Config
 NUM_CLASSES = 12
 MAX_LEN = 150  # máximo número de tracks
-BATCH_SIZE = 32
+BATCH_SIZE = 16
 MAX_EPOCHS = 10000
 LOCAL = False
-ALIAS = "my_first_prob"
+ALIAS = "my_first_prob_bs4"
 
 
 class SimpleAveragingClassifier(pl.LightningModule):
-    def __init__(self, input_dim, hidden_dim=512, lr=0.0005):
+    def __init__(self, input_dim, hidden_dim=512, lr=0.0005, split_id=0):
         super().__init__()
         self.save_hyperparameters()
         self.reduce_tracks = nn.Linear(MAX_LEN, 1)
@@ -33,6 +33,7 @@ class SimpleAveragingClassifier(pl.LightningModule):
 
         self.validation_step_outputs = []
         self.test_step_outputs = []
+        self.split_id = split_id
 
     def forward(self, x, lengths):
         B, N, D = x.shape
@@ -52,6 +53,7 @@ class SimpleAveragingClassifier(pl.LightningModule):
     def training_step(self, batch, batch_idx):
         x, y, lengths = batch
         logits = self(x, lengths)
+        self.log(f"train_loss_{self.split_id}", nn.functional.cross_entropy(logits, y), on_step=False, on_epoch=True, prog_bar=True)
         return nn.functional.cross_entropy(logits, y)
 
     def validation_step(self, batch, batch_idx):
@@ -59,6 +61,9 @@ class SimpleAveragingClassifier(pl.LightningModule):
         logits = self(x, lengths)
         preds = torch.argmax(logits, dim=1)
         self.validation_step_outputs.append({"y_true": y.cpu(), "y_pred": preds.cpu()})
+        # Log validation loss
+        loss = nn.functional.cross_entropy(logits, y)
+        self.log(f"val_loss_{self.split_id}", loss, on_step=False, on_epoch=True, prog_bar=True)
         return
 
     def on_validation_epoch_end(self):
@@ -74,8 +79,8 @@ class SimpleAveragingClassifier(pl.LightningModule):
             class_mses.append(mse)
         macro_mse = np.mean(class_mses)
 
-        self.log("val_accuracy", acc)
-        self.log("val_macro_mse", macro_mse)
+        self.log(f"val_accuracy_{self.split_id}", acc)
+        self.log(f"val_macro_mse_{self.split_id}", macro_mse)
         self.acc = acc
         self.mse = macro_mse
         self.validation_step_outputs.clear()
@@ -106,19 +111,16 @@ class SimpleAveragingClassifier(pl.LightningModule):
         return torch.optim.Adam(self.parameters(), lr=self.hparams.lr)
 
 
-def run_split(split_id, json_path, embeddings_dir):
-    with open(json_path) as f:
-        all_splits = json.load(f)
+def run_split(split_id, all_splits, all_embeddings):
     split = all_splits[str(split_id)]
-    train_dataset = PianoSyllabusDataset(split["train"], embeddings_dir)
-    val_dataset = PianoSyllabusDataset(split["val"], embeddings_dir)
-    test_dataset = PianoSyllabusDataset(split["test"], embeddings_dir)
+    train_dataset = PianoSyllabusDataset(split["train"], all_embeddings)
+    val_dataset = PianoSyllabusDataset(split["val"], all_embeddings)
+    test_dataset = PianoSyllabusDataset(split["test"], all_embeddings)
 
-    first_path = list(split["train"].keys())[0]
-    sample = torch.load(embeddings_dir / first_path[:3] / f"{first_path}.pt")
-    input_dim = sample.shape[-1]
+    first_sample = train_dataset[0][0]
+    input_dim = first_sample.shape[-1]
 
-    model = SimpleAveragingClassifier(input_dim=input_dim)
+    model = SimpleAveragingClassifier(input_dim=input_dim, hidden_dim=512, split_id=split_id)
 
     run_name = f"{ALIAS}{split_id}"
     wandb_params = {
@@ -133,7 +135,7 @@ def run_split(split_id, json_path, embeddings_dir):
     wandb_logger = WandbLogger(**wandb_params) if not LOCAL else None
 
     callbacks = [
-        EarlyStopping(monitor="val_accuracy", mode="max", patience=4, verbose=True)
+        EarlyStopping(monitor=f"val_accuracy_{split_id}", mode="max", patience=4, verbose=True)
     ]
 
     trainer = pl.Trainer(
@@ -163,14 +165,39 @@ if __name__ == "__main__":
     os.system("rsync -avz --progress /gpfs/projects/upf97/embeddings_ssl/pq1scuuq/PianoSyllabus /scratch/tmp")
     embeddings_dir = Path("/scratch/tmp/PianoSyllabus")
 
+    # Cargar splits
+    with open(json_path) as f:
+        all_splits = json.load(f)
+
+    # Obtener todos los nombres de piezas únicos en los splits
+    all_piece_names = set()
+    for split in all_splits.values():
+        for part in ["train", "val", "test"]:
+            all_piece_names.update(split[part].keys())
+
+    # Cargar todos los embeddings una vez
+    all_embeddings = {}
+    for piece_name in all_piece_names:
+        emb_path = embeddings_dir / piece_name[:3] / f"{piece_name}.pt"
+        if emb_path.exists():
+            embedding = torch.load(emb_path)
+            if embedding.ndim == 4 and embedding.size(0) == 1:
+                embedding = embedding.squeeze(0)
+            embedding = embedding.permute(2, 0, 1)
+            embedding = embedding.clone().detach().float()
+            embedding = embedding.mean(dim=-1).transpose(0, 1)
+            all_embeddings[piece_name] = embedding
+        else:
+            print(f"[INFO] Excluido: {emb_path} no existe")
+
     accs, mses = [], []
     for split_id in range(5):
         print(f"=== Split {split_id} ===")
-        acc, mse = run_split(split_id, json_path, embeddings_dir)
+        acc, mse = run_split(split_id, all_splits, all_embeddings)
         accs.append(acc)
         mses.append(mse)
         print(f"[VAL] Balanced Accuracy: {acc:.4f} | Macro MSE: {mse:.4f}")
 
-    print("\\n=== Resultados Finales ===")
+    print("\n=== Resultados Finales ===")
     print(f"Balanced Accuracy: {np.mean(accs):.4f} ± {np.std(accs):.4f}")
     print(f"Macro MSE:         {np.mean(mses):.4f} ± {np.std(mses):.4f}")
